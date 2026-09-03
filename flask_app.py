@@ -3,13 +3,12 @@ import psycopg2
 import csv
 import io
 from datetime import datetime, date
-from flask import Flask, render_template_string, request, redirect, url_for, session, flash, Response
+from flask import Flask, render_template_string, request, redirect, url_for, session, flash, Response, jsonify
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "chave_secreta_nuvem_escola")
 
 SENHA_SISTEMA = "#cmilitarJP"
-# Pega a URL do banco de dados das variáveis de ambiente (Render)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 def get_db_connection():
@@ -22,7 +21,7 @@ def init_db():
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Usamos SERIAL em vez de AUTOINCREMENT no Postgres
+        # Criação das tabelas base
         cur.execute('''CREATE TABLE IF NOT EXISTS computadores (
                         id SERIAL PRIMARY KEY,
                         setor TEXT, 
@@ -41,18 +40,22 @@ def init_db():
                         categoria TEXT DEFAULT 'Geral',
                         FOREIGN KEY(pc_id) REFERENCES computadores(id))''')
 
+        # Verifica e adiciona a coluna de numero_registro caso ela não exista
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='computadores' AND column_name='numero_registro'")
+        if not cur.fetchone():
+            cur.execute("ALTER TABLE computadores ADD COLUMN numero_registro TEXT")
+
         conn.commit()
         cur.close()
         conn.close()
     except Exception as e:
         print(f"Erro ao inicializar o banco: {e}")
 
-# Só tenta inicializar o banco se a URL existir
 if DATABASE_URL:
     init_db()
 
 # =====================================================================
-# TEMPLATE VISUAL ÚNICO (Mantido exatamente como o seu original)
+# TEMPLATE VISUAL ÚNICO (Com Rodapé e Notificações Injetadas)
 # =====================================================================
 BASE_LAYOUT = """
 <!DOCTYPE html>
@@ -61,12 +64,14 @@ BASE_LAYOUT = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Inventário TI - Sistema Escolar</title>
+    <!-- Favicon dinâmico para notificação -->
+    <link id="favicon" rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230071e3' rx='20'/></svg>">
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f5f5f7; color: #1d1d1f; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f5f5f7; color: #1d1d1f; margin: 0; padding: 0; display: flex; flex-direction: column; min-height: 100vh;}
         .navbar { background: rgba(255, 255, 255, 0.8); backdrop-filter: blur(20px); position: sticky; top: 0; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #d2d2d7; z-index: 100; }
         .navbar a { text-decoration: none; color: #1d1d1f; font-weight: 600; font-size: 18px; }
-        .nav-links a { font-size: 14px; color: #0071e3; margin-left: 20px; font-weight: 400; }
-        .container { max-width: 900px; margin: 40px auto; padding: 0 20px; }
+        .nav-links a { font-size: 14px; color: #0071e3; margin-left: 20px; font-weight: 400; display: inline-flex; align-items: center; }
+        .container { max-width: 900px; margin: 40px auto; padding: 0 20px; flex: 1; width: 100%; box-sizing: border-box; }
         .card { background: #ffffff; border-radius: 18px; padding: 30px; box-shadow: 0 4px 20px rgba(0,0,0,0.04); margin-bottom: 25px; }
         h1, h2, h3 { font-weight: 600; letter-spacing: -0.5px; margin-top: 0; }
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }
@@ -105,6 +110,9 @@ BASE_LAYOUT = """
 
         .search-bar { width: 100%; padding: 15px; font-size: 16px; border: 2px solid #d2d2d7; border-radius: 12px; margin-bottom: 20px; background: #f5f5f7 url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="%2386868b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>') no-repeat 15px center; padding-left: 45px; }
         .search-bar:focus { background-color: #fff; border-color: #0071e3; }
+        
+        .footer { display: flex; justify-content: space-between; align-items: center; padding: 25px 30px; background: #fff; border-top: 1px solid #d2d2d7; font-size: 13px; color: #86868b; margin-top: auto; }
+        .notification-dot { display: none; background:#ff9500; color:#fff; border-radius:50%; padding:2px 6px; font-size:11px; margin-left:6px; font-weight:bold; }
     </style>
     <script>
         function buscarInventario() {
@@ -134,6 +142,31 @@ BASE_LAYOUT = """
                 }
             });
         }
+
+        // Sistema de notificação em tempo real
+        function checkNotifications() {
+            fetch('/api/chamados_status')
+                .then(res => res.json())
+                .then(data => {
+                    let fav = document.getElementById('favicon');
+                    let badge = document.getElementById('nav-badge');
+                    if (data.abertos > 0) {
+                        fav.href = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='50' fill='%23ff9500'/></svg>";
+                        document.title = '(🔔) Novo Chamado! - TI Escolar';
+                        if(badge) { 
+                            badge.style.display = 'inline-block'; 
+                            badge.innerText = data.abertos; 
+                        }
+                    } else {
+                        fav.href = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230071e3' rx='20'/></svg>";
+                        document.title = 'Inventário TI - Sistema Escolar';
+                        if(badge) { badge.style.display = 'none'; }
+                    }
+                })
+                .catch(err => console.log('Erro de notificação', err));
+        }
+        setInterval(checkNotifications, 20000); // Checa a cada 20 segundos
+        window.onload = checkNotifications;
     </script>
 </head>
 <body>
@@ -141,7 +174,7 @@ BASE_LAYOUT = """
         <a href="/">💻 Inventário TI Escolar</a>
         <div class="nav-links">
             {% if session.get('logged_in') %}
-                <a href="/admin">Painel Admin</a>
+                <a href="/admin">Painel Admin <span id="nav-badge" class="notification-dot"></span></a>
                 <a href="/logout" style="color: #ff3b30;">Sair</a>
             {% else %}
                 <a href="/login">Área do Professor</a>
@@ -158,6 +191,10 @@ BASE_LAYOUT = """
         {% endwith %}
         {{ content | safe }}
     </div>
+    <div class="footer">
+        <div>Desenvolvido por <strong>Fellipe Picetskei</strong></div>
+        <div>Contato: fellipe.picetskei@gmail.com</div>
+    </div>
 </body>
 </html>
 """
@@ -168,7 +205,6 @@ BASE_LAYOUT = """
 def precisa_preventiva(data_valor):
     if not data_valor: return True
     try:
-        # No Postgres/psycopg2, a data já pode vir como objeto datetime.date
         if isinstance(data_valor, date):
             diferenca = date.today() - data_valor
         else:
@@ -179,8 +215,18 @@ def precisa_preventiva(data_valor):
         return True
 
 # =====================================================================
-# ROTAS DO SISTEMA
+# ROTAS DO SISTEMA E API
 # =====================================================================
+
+@app.route('/api/chamados_status')
+def api_chamados_status():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(id) FROM chamados WHERE status = 'Aberto'")
+    qtd_abertos = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    return jsonify({"abertos": qtd_abertos})
 
 @app.route('/')
 def index():
@@ -230,17 +276,17 @@ def admin():
         ram = request.form.get('ram')
         arm = request.form.get('armazenamento')
         ext = request.form.get('extra')
+        registro = request.form.get('registro')
         prev = request.form.get('preventiva')
-        prev = prev if prev else None # Se vazio, joga None para o Postgres aceitar
+        prev = prev if prev else None
 
-        # No Postgres, usamos %s em vez de ?
-        c.execute("INSERT INTO computadores (setor, cpu, ram, armazenamento, infos_extras, ultima_preventiva) VALUES (%s,%s,%s,%s,%s,%s)",
-                  (setor, cpu, ram, arm, ext, prev))
+        c.execute("INSERT INTO computadores (setor, cpu, ram, armazenamento, infos_extras, ultima_preventiva, numero_registro) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                  (setor, cpu, ram, arm, ext, prev, registro))
         conn.commit()
         flash('Computador cadastrado com sucesso!', 'success')
         return redirect('/admin?tab=inventario')
 
-    c.execute("SELECT id, setor, cpu, ram, armazenamento, infos_extras, ultima_preventiva FROM computadores ORDER BY setor ASC, id ASC")
+    c.execute("SELECT id, setor, cpu, ram, armazenamento, infos_extras, ultima_preventiva, numero_registro FROM computadores ORDER BY setor ASC, id ASC")
     pcs = c.fetchall()
     c.execute("SELECT c.id, p.setor, c.descricao, c.data_chamado, c.status, c.categoria, p.id FROM chamados c JOIN computadores p ON c.pc_id = p.id WHERE c.status IN ('Aberto', 'Em Manutenção') ORDER BY c.status ASC, c.id DESC")
     chamados_ativos = c.fetchall()
@@ -273,11 +319,13 @@ def admin():
                 linhas_tabela = ""
                 for pc in maquinas:
                     alerta_prev = '<span style="background:#ffcc00; color:#1d1d1f; padding:3px 8px; border-radius:10px; font-size:11px; font-weight:bold; margin-left:8px; display:inline-block;" title="Limpeza atrasada (mais de 6 meses)">⚠️ Limpeza</span>' if precisa_preventiva(pc[6]) else ''
+                    # pc[7] = numero_registro
+                    reg_text = f" | Reg: {pc[7]}" if pc[7] else ""
 
                     linhas_tabela += f"""
                     <tr class="linha-pc">
                         <td style="white-space: nowrap;"><strong>#{pc[0]}</strong> {alerta_prev}</td>
-                        <td>{pc[2]} <br> <span style="color:#86868b; font-size:12px;">{pc[3]} | {pc[4]} | Última Prev: {pc[6] or 'Nunca'}</span></td>
+                        <td>{pc[2]} <br> <span style="color:#86868b; font-size:12px;">{pc[3]} | {pc[4]}{reg_text} | Última Prev: {pc[6] or 'Nunca'}</span></td>
                         <td style="text-align: right; white-space: nowrap;">
                             <a href="/admin/imprimir/{pc[0]}" target="_blank"><button style="padding:6px 12px; font-size:12px;">QR Code</button></a>
                             <a href="/admin/duplicar/{pc[0]}"><button style="padding:6px 12px; font-size:12px; background:#5e5ce6;">Clonar</button></a>
@@ -288,7 +336,13 @@ def admin():
                     """
                 conteudo += f"""
                 <details>
-                    <summary><span>📍 {setor}</span><span class="badge" style="background:#0071e3; color:white;">{len(maquinas)} PCs</span></summary>
+                    <summary>
+                        <span>📍 {setor}</span>
+                        <div style="display:flex; align-items:center;">
+                            <button onclick="event.stopPropagation(); window.open('/admin/imprimir_setor/{setor}', '_blank');" style="margin-right:15px; padding:6px 12px; font-size:12px; background:#107c41;">🖨️ QRs do Setor</button>
+                            <span class="badge" style="background:#0071e3; color:white;">{len(maquinas)} PCs</span>
+                        </div>
+                    </summary>
                     <div class="details-content"><table><tr><th>ID</th><th>Especificações</th><th style="text-align: right;">Ações</th></tr>{linhas_tabela}</table></div>
                 </details>
                 """
@@ -305,9 +359,10 @@ def admin():
                 <div class="form-group"><label>Armazenamento</label><input type="text" name="armazenamento"></div>
             </div>
             <div class="grid">
+                <div class="form-group"><label>Nº de Registro (Estado/Garantia)</label><input type="text" name="registro" placeholder="Ex: 001234"></div>
                 <div class="form-group"><label>Última Manutenção Preventiva</label><input type="date" name="preventiva" value="{hoje}"></div>
-                <div class="form-group"><label>Notas Técnicas</label><textarea name="extra" rows="1"></textarea></div>
             </div>
+            <div class="form-group"><label>Notas Técnicas</label><textarea name="extra" rows="2"></textarea></div>
             <button type="submit">Salvar no Banco em Nuvem</button>
         </form>
         """
@@ -396,8 +451,57 @@ def admin():
     return render_template_string(BASE_LAYOUT, content=menu + '<div class="card">' + conteudo + '</div>')
 
 # =====================================================================
-# AÇÕES: EXPORTAR, MUDAR STATUS, EDITAR, CLONAR
+# AÇÕES: EXPORTAR, MUDAR STATUS, EDITAR, CLONAR E IMPRIMIR
 # =====================================================================
+
+@app.route('/admin/imprimir_setor/<string:setor>')
+def imprimir_setor(setor):
+    if not session.get('logged_in'): return redirect(url_for('login'))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, setor FROM computadores WHERE setor=%s", (setor,))
+    pcs = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    qrs_html = ""
+    for pc in pcs:
+        qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={request.url_root}pc/{pc[0]}"
+        qrs_html += f"""
+        <div style="text-align:center; padding:15px; border:1px dashed #d2d2d7; border-radius:12px; width:170px; background:#fff;">
+            <h3 style="margin: 0 0 10px 0; font-size:16px;">ID: {pc[0]}<br><span style="font-size:13px; color:#86868b;">{pc[1]}</span></h3>
+            <img src="{qr_url}" alt="QR" width="150" height="150">
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <title>QRs - {setor}</title>
+        <style>
+            body {{ font-family: sans-serif; background: #f5f5f7; padding: 20px; }}
+            .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }}
+            .grid {{ display: flex; flex-wrap: wrap; gap: 20px; }}
+            @media print {{
+                body {{ background: #fff; padding: 0; }}
+                .no-print {{ display: none !important; }}
+                .grid {{ gap: 10px; }}
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h2>Lote de QR Codes - {setor}</h2>
+            <button onclick="window.print()" class="no-print" style="padding:10px 20px; background:#0071e3; color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:bold;">🖨️ Imprimir Página</button>
+        </div>
+        <div class="grid">
+            {qrs_html}
+        </div>
+    </body>
+    </html>
+    """
 
 @app.route('/admin/exportar_csv')
 def exportar_csv():
@@ -442,11 +546,11 @@ def duplicar_pc(pc_id):
     if not session.get('logged_in'): return redirect(url_for('login'))
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT setor, cpu, ram, armazenamento, infos_extras FROM computadores WHERE id=%s", (pc_id,))
+    cur.execute("SELECT setor, cpu, ram, armazenamento, infos_extras, numero_registro FROM computadores WHERE id=%s", (pc_id,))
     pc = cur.fetchone()
     if pc:
         hoje = date.today().strftime('%Y-%m-%d')
-        cur.execute("INSERT INTO computadores (setor, cpu, ram, armazenamento, infos_extras, ultima_preventiva) VALUES (%s,%s,%s,%s,%s,%s)", (*pc, hoje))
+        cur.execute("INSERT INTO computadores (setor, cpu, ram, armazenamento, infos_extras, numero_registro, ultima_preventiva) VALUES (%s,%s,%s,%s,%s,%s,%s)", (*pc, hoje))
         conn.commit()
         flash('Máquina clonada com sucesso!', 'success')
     cur.close()
@@ -461,16 +565,17 @@ def editar_pc(pc_id):
     
     if request.method == 'POST':
         setor, cpu, ram, arm, ext, prev = request.form.get('setor'), request.form.get('cpu'), request.form.get('ram'), request.form.get('armazenamento'), request.form.get('extra'), request.form.get('preventiva')
+        registro = request.form.get('registro')
         prev = prev if prev else None
-        cur.execute("UPDATE computadores SET setor=%s, cpu=%s, ram=%s, armazenamento=%s, infos_extras=%s, ultima_preventiva=%s WHERE id=%s", 
-                    (setor, cpu, ram, arm, ext, prev, pc_id))
+        cur.execute("UPDATE computadores SET setor=%s, cpu=%s, ram=%s, armazenamento=%s, infos_extras=%s, ultima_preventiva=%s, numero_registro=%s WHERE id=%s", 
+                    (setor, cpu, ram, arm, ext, prev, registro, pc_id))
         conn.commit()
         cur.close()
         conn.close()
         flash('Configurações atualizadas!', 'success')
         return redirect('/admin?tab=inventario')
 
-    cur.execute("SELECT id, setor, cpu, ram, armazenamento, infos_extras, ultima_preventiva FROM computadores WHERE id=%s", (pc_id,))
+    cur.execute("SELECT id, setor, cpu, ram, armazenamento, infos_extras, ultima_preventiva, numero_registro FROM computadores WHERE id=%s", (pc_id,))
     pc = cur.fetchone()
     cur.close()
     conn.close()
@@ -484,11 +589,14 @@ def editar_pc(pc_id):
                 <div class="form-group"><label>CPU</label><input type="text" name="cpu" value="{pc[2]}"></div>
                 <div class="form-group"><label>RAM</label><input type="text" name="ram" value="{pc[3]}"></div>
                 <div class="form-group"><label>Armazenamento</label><input type="text" name="armazenamento" value="{pc[4]}"></div>
+            </div>
+            <div class="grid">
+                <div class="form-group"><label>Nº de Registro (Garantia)</label><input type="text" name="registro" value="{pc[7] or ''}"></div>
                 <div class="form-group"><label>Data da Última Limpeza</label><input type="date" name="preventiva" value="{pc[6] or ''}"></div>
             </div>
-            <div class="form-group"><label>Notas</label><textarea name="extra" rows="2">{pc[5]}</textarea></div>
+            <div class="form-group"><label>Notas Técnicas</label><textarea name="extra" rows="2">{pc[5]}</textarea></div>
             <div style="display: flex; gap: 10px;">
-                <button type="submit" style="flex: 1;">Salvar</button>
+                <button type="submit" style="flex: 1;">Salvar Alterações</button>
                 <a href="/admin?tab=inventario" style="text-decoration: none; flex: 1;"><button type="button" style="background: #86868b; width: 100%;">Cancelar</button></a>
             </div>
         </form>
@@ -534,7 +642,7 @@ def imprimir_qr(pc_id):
 def view_pc(pc_id):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT id, setor, cpu, ram, armazenamento, infos_extras FROM computadores WHERE id=%s", (pc_id,))
+    cur.execute("SELECT id, setor, cpu, ram, armazenamento, infos_extras, numero_registro FROM computadores WHERE id=%s", (pc_id,))
     pc = cur.fetchone()
     if not pc: return "PC não encontrado.", 404
 
@@ -596,6 +704,7 @@ def view_pc(pc_id):
             <p style="margin:5px 0;"><strong>CPU:</strong> {pc[2]}</p>
             <p style="margin:5px 0;"><strong>RAM:</strong> {pc[3]}</p>
             <p style="margin:5px 0;"><strong>Disco:</strong> {pc[4]}</p>
+            <p style="margin:5px 0;"><strong>Nº de Registro (Estado):</strong> {pc[6] or 'Não informado'}</p>
         </div>
         <hr style="border:0; border-top:1px solid #d2d2d7; margin:20px 0;">
         <h2>Relatar Problema</h2>
@@ -604,6 +713,5 @@ def view_pc(pc_id):
     """)
 
 if __name__ == "__main__":
-    # O Render exige que você use a porta definida por eles
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
