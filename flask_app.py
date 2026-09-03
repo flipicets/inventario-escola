@@ -1,46 +1,58 @@
 import os
-import sqlite3
+import psycopg2
 import csv
 import io
 from datetime import datetime, date
 from flask import Flask, render_template_string, request, redirect, url_for, session, flash, Response
 
 app = Flask(__name__)
-app.secret_key = "chave_secreta_nuvem_escola"
+app.secret_key = os.environ.get("SECRET_KEY", "chave_secreta_nuvem_escola")
 
 SENHA_SISTEMA = "#cmilitarJP"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "banco_escola.db")
+# Pega a URL do banco de dados das variáveis de ambiente (Render)
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+def get_db_connection():
+    if not DATABASE_URL:
+        raise ValueError("A variável de ambiente DATABASE_URL não foi configurada!")
+    return psycopg2.connect(DATABASE_URL)
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
 
-    c.execute('''CREATE TABLE IF NOT EXISTS computadores (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    setor TEXT, cpu TEXT, ram TEXT, armazenamento TEXT, infos_extras TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS chamados (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, pc_id INTEGER, descricao TEXT,
-                    data_chamado TIMESTAMP DEFAULT CURRENT_TIMESTAMP, status TEXT DEFAULT 'Aberto',
-                    FOREIGN KEY(pc_id) REFERENCES computadores(id))''')
+        # Usamos SERIAL em vez de AUTOINCREMENT no Postgres
+        cur.execute('''CREATE TABLE IF NOT EXISTS computadores (
+                        id SERIAL PRIMARY KEY,
+                        setor TEXT, 
+                        cpu TEXT, 
+                        ram TEXT, 
+                        armazenamento TEXT, 
+                        infos_extras TEXT,
+                        ultima_preventiva DATE)''')
+                        
+        cur.execute('''CREATE TABLE IF NOT EXISTS chamados (
+                        id SERIAL PRIMARY KEY, 
+                        pc_id INTEGER, 
+                        descricao TEXT,
+                        data_chamado TIMESTAMP DEFAULT CURRENT_TIMESTAMP, 
+                        status TEXT DEFAULT 'Aberto',
+                        categoria TEXT DEFAULT 'Geral',
+                        FOREIGN KEY(pc_id) REFERENCES computadores(id))''')
 
-    c.execute("PRAGMA table_info(computadores)")
-    colunas_pc = [col[1] for col in c.fetchall()]
-    if 'ultima_preventiva' not in colunas_pc:
-        c.execute("ALTER TABLE computadores ADD COLUMN ultima_preventiva DATE")
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Erro ao inicializar o banco: {e}")
 
-    c.execute("PRAGMA table_info(chamados)")
-    colunas_ch = [col[1] for col in c.fetchall()]
-    if 'categoria' not in colunas_ch:
-        c.execute("ALTER TABLE chamados ADD COLUMN categoria TEXT DEFAULT 'Geral'")
-
-    conn.commit()
-    conn.close()
-
-init_db()
+# Só tenta inicializar o banco se a URL existir
+if DATABASE_URL:
+    init_db()
 
 # =====================================================================
-# TEMPLATE VISUAL ÚNICO
+# TEMPLATE VISUAL ÚNICO (Mantido exatamente como o seu original)
 # =====================================================================
 BASE_LAYOUT = """
 <!DOCTYPE html>
@@ -153,11 +165,15 @@ BASE_LAYOUT = """
 # =====================================================================
 # FUNÇÕES AUXILIARES
 # =====================================================================
-def precisa_preventiva(data_str):
-    if not data_str: return True
+def precisa_preventiva(data_valor):
+    if not data_valor: return True
     try:
-        data_prev = datetime.strptime(data_str, '%Y-%m-%d').date()
-        diferenca = date.today() - data_prev
+        # No Postgres/psycopg2, a data já pode vir como objeto datetime.date
+        if isinstance(data_valor, date):
+            diferenca = date.today() - data_valor
+        else:
+            data_prev = datetime.strptime(str(data_valor), '%Y-%m-%d').date()
+            diferenca = date.today() - data_prev
         return diferenca.days > 180
     except:
         return True
@@ -205,7 +221,7 @@ def admin():
     if not session.get('logged_in'): return redirect(url_for('login'))
 
     tab = request.args.get('tab', 'inventario')
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
 
     if request.method == 'POST' and tab == 'cadastrar':
@@ -214,9 +230,11 @@ def admin():
         ram = request.form.get('ram')
         arm = request.form.get('armazenamento')
         ext = request.form.get('extra')
-        prev = request.form.get('preventiva') or date.today().strftime('%Y-%m-%d')
+        prev = request.form.get('preventiva')
+        prev = prev if prev else None # Se vazio, joga None para o Postgres aceitar
 
-        c.execute("INSERT INTO computadores (setor, cpu, ram, armazenamento, infos_extras, ultima_preventiva) VALUES (?,?,?,?,?,?)",
+        # No Postgres, usamos %s em vez de ?
+        c.execute("INSERT INTO computadores (setor, cpu, ram, armazenamento, infos_extras, ultima_preventiva) VALUES (%s,%s,%s,%s,%s,%s)",
                   (setor, cpu, ram, arm, ext, prev))
         conn.commit()
         flash('Computador cadastrado com sucesso!', 'success')
@@ -254,7 +272,6 @@ def admin():
             for setor, maquinas in pcs_por_setor.items():
                 linhas_tabela = ""
                 for pc in maquinas:
-                    # CORREÇÃO DA TAG: Estilo inline seguro e sem quebra de linha (white-space: nowrap)
                     alerta_prev = '<span style="background:#ffcc00; color:#1d1d1f; padding:3px 8px; border-radius:10px; font-size:11px; font-weight:bold; margin-left:8px; display:inline-block;" title="Limpeza atrasada (mais de 6 meses)">⚠️ Limpeza</span>' if precisa_preventiva(pc[6]) else ''
 
                     linhas_tabela += f"""
@@ -322,14 +339,12 @@ def admin():
         """
 
     elif tab == 'diagnostico':
-        # Consulta para os quadros de risco
         c.execute("SELECT categoria, COUNT(id) FROM chamados GROUP BY categoria ORDER BY COUNT(id) DESC")
         categorias = c.fetchall()
 
         c.execute("""SELECT p.setor, COUNT(c.id) FROM chamados c JOIN computadores p ON c.pc_id = p.id GROUP BY p.setor ORDER BY COUNT(c.id) DESC""")
         risco_setores = c.fetchall()
 
-        # CORREÇÃO: Consulta para buscar o histórico de resolvidos que havia sumido
         c.execute("""SELECT c.id, p.setor, c.pc_id, c.descricao, c.data_chamado
                      FROM chamados c
                      JOIN computadores p ON c.pc_id = p.id
@@ -341,12 +356,13 @@ def admin():
 
         linhas_hist = ""
         for hist in historico_resolvidos:
+            data_formatada = hist[4].strftime('%d/%m/%Y %H:%M') if isinstance(hist[4], datetime) else hist[4]
             linhas_hist += f"""
             <tr>
                 <td><strong>#{hist[0]}</strong></td>
                 <td>{hist[1]} (PC #{hist[2]})</td>
                 <td>{hist[3]}</td>
-                <td style="color:#86868b;">{hist[4]}</td>
+                <td style="color:#86868b;">{data_formatada}</td>
                 <td><span class="badge resolved">Concluído</span></td>
             </tr>
             """
@@ -366,10 +382,8 @@ def admin():
                 <table><tr><th>Categoria</th><th>Volume</th></tr>{linhas_cat or '<tr><td colspan="2">Sem dados</td></tr>'}</table>
             </div>
         </div>
-
         <br><br>
         <hr style="border:0; border-top:1px solid #d2d2d7; margin:20px 0;">
-
         <h3>Histórico Geral de Manutenções Concluídas</h3>
         <table>
             <tr><th>ID Chamado</th><th>Origem</th><th>Problema Consertado</th><th>Data do Registro</th><th>Status</th></tr>
@@ -377,6 +391,7 @@ def admin():
         </table>
         """
 
+    c.close()
     conn.close()
     return render_template_string(BASE_LAYOUT, content=menu + '<div class="card">' + conteudo + '</div>')
 
@@ -387,11 +402,12 @@ def admin():
 @app.route('/admin/exportar_csv')
 def exportar_csv():
     if not session.get('logged_in'): return redirect(url_for('login'))
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""SELECT c.id, p.setor, p.id, c.categoria, c.descricao, c.status, c.data_chamado
                  FROM chamados c JOIN computadores p ON c.pc_id = p.id ORDER BY c.data_chamado DESC""")
     dados = c.fetchall()
+    c.close()
     conn.close()
 
     output = io.StringIO()
@@ -405,13 +421,18 @@ def exportar_csv():
 @app.route('/admin/mudar_status/<int:ch_id>/<status>')
 def mudar_status(ch_id, status):
     if not session.get('logged_in'): return redirect(url_for('login'))
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE chamados SET status=? WHERE id=?", (status, ch_id))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE chamados SET status=%s WHERE id=%s", (status, ch_id))
+    
     if status == 'Resolvido':
-        pc_id = conn.execute("SELECT pc_id FROM chamados WHERE id=?", (ch_id,)).fetchone()[0]
+        cur.execute("SELECT pc_id FROM chamados WHERE id=%s", (ch_id,))
+        pc_id = cur.fetchone()[0]
         hoje = date.today().strftime('%Y-%m-%d')
-        conn.execute("UPDATE computadores SET ultima_preventiva=? WHERE id=?", (hoje, pc_id))
+        cur.execute("UPDATE computadores SET ultima_preventiva=%s WHERE id=%s", (hoje, pc_id))
+        
     conn.commit()
+    cur.close()
     conn.close()
     flash(f'Status atualizado para: {status}', 'success')
     return redirect('/admin?tab=chamados')
@@ -419,29 +440,39 @@ def mudar_status(ch_id, status):
 @app.route('/admin/duplicar/<int:pc_id>')
 def duplicar_pc(pc_id):
     if not session.get('logged_in'): return redirect(url_for('login'))
-    conn = sqlite3.connect(DB_PATH)
-    pc = conn.execute("SELECT setor, cpu, ram, armazenamento, infos_extras FROM computadores WHERE id=?", (pc_id,)).fetchone()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT setor, cpu, ram, armazenamento, infos_extras FROM computadores WHERE id=%s", (pc_id,))
+    pc = cur.fetchone()
     if pc:
         hoje = date.today().strftime('%Y-%m-%d')
-        conn.execute("INSERT INTO computadores (setor, cpu, ram, armazenamento, infos_extras, ultima_preventiva) VALUES (?,?,?,?,?,?)", (*pc, hoje))
+        cur.execute("INSERT INTO computadores (setor, cpu, ram, armazenamento, infos_extras, ultima_preventiva) VALUES (%s,%s,%s,%s,%s,%s)", (*pc, hoje))
         conn.commit()
         flash('Máquina clonada com sucesso!', 'success')
+    cur.close()
     conn.close()
     return redirect('/admin?tab=inventario')
 
 @app.route('/admin/editar/<int:pc_id>', methods=['GET', 'POST'])
 def editar_pc(pc_id):
     if not session.get('logged_in'): return redirect(url_for('login'))
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
     if request.method == 'POST':
         setor, cpu, ram, arm, ext, prev = request.form.get('setor'), request.form.get('cpu'), request.form.get('ram'), request.form.get('armazenamento'), request.form.get('extra'), request.form.get('preventiva')
-        conn.execute("UPDATE computadores SET setor=?, cpu=?, ram=?, armazenamento=?, infos_extras=?, ultima_preventiva=? WHERE id=?", (setor, cpu, ram, arm, ext, prev, pc_id))
+        prev = prev if prev else None
+        cur.execute("UPDATE computadores SET setor=%s, cpu=%s, ram=%s, armazenamento=%s, infos_extras=%s, ultima_preventiva=%s WHERE id=%s", 
+                    (setor, cpu, ram, arm, ext, prev, pc_id))
         conn.commit()
+        cur.close()
         conn.close()
         flash('Configurações atualizadas!', 'success')
         return redirect('/admin?tab=inventario')
 
-    pc = conn.execute("SELECT id, setor, cpu, ram, armazenamento, infos_extras, ultima_preventiva FROM computadores WHERE id=?", (pc_id,)).fetchone()
+    cur.execute("SELECT id, setor, cpu, ram, armazenamento, infos_extras, ultima_preventiva FROM computadores WHERE id=%s", (pc_id,))
+    pc = cur.fetchone()
+    cur.close()
     conn.close()
 
     conteudo_editar = f"""
@@ -468,10 +499,12 @@ def editar_pc(pc_id):
 @app.route('/admin/deletar/<int:pc_id>')
 def deletar_pc(pc_id):
     if not session.get('logged_in'): return redirect(url_for('login'))
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("DELETE FROM chamados WHERE pc_id=?", (pc_id,))
-    conn.execute("DELETE FROM computadores WHERE id=?", (pc_id,))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM chamados WHERE pc_id=%s", (pc_id,))
+    cur.execute("DELETE FROM computadores WHERE id=%s", (pc_id,))
     conn.commit()
+    cur.close()
     conn.close()
     flash('Computador removido!', 'success')
     return redirect('/admin?tab=inventario')
@@ -479,7 +512,13 @@ def deletar_pc(pc_id):
 @app.route('/admin/imprimir/<int:pc_id>')
 def imprimir_qr(pc_id):
     if not session.get('logged_in'): return redirect(url_for('login'))
-    pc = sqlite3.connect(DB_PATH).execute("SELECT id, setor FROM computadores WHERE id=?", (pc_id,)).fetchone()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, setor FROM computadores WHERE id=%s", (pc_id,))
+    pc = cur.fetchone()
+    cur.close()
+    conn.close()
+    
     qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={request.url_root}pc/{pc_id}"
     return f"""
     <div style="font-family:sans-serif; text-align:center; max-width:300px; margin:50px auto; padding:20px; border:2px dashed #d2d2d7; border-radius:15px;">
@@ -493,22 +532,26 @@ def imprimir_qr(pc_id):
 # =====================================================================
 @app.route('/pc/<int:pc_id>', methods=['GET', 'POST'])
 def view_pc(pc_id):
-    conn = sqlite3.connect(DB_PATH)
-    pc = conn.execute("SELECT id, setor, cpu, ram, armazenamento, infos_extras FROM computadores WHERE id=?", (pc_id,)).fetchone()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, setor, cpu, ram, armazenamento, infos_extras FROM computadores WHERE id=%s", (pc_id,))
+    pc = cur.fetchone()
     if not pc: return "PC não encontrado.", 404
 
-    chamado_ativo = conn.execute("SELECT status FROM chamados WHERE pc_id=? AND status IN ('Aberto', 'Em Manutenção')", (pc_id,)).fetchone()
+    cur.execute("SELECT status FROM chamados WHERE pc_id=%s AND status IN ('Aberto', 'Em Manutenção')", (pc_id,))
+    chamado_ativo = cur.fetchone()
 
     if request.method == 'POST' and not chamado_ativo:
         senha, desc, cat = request.form.get('senha'), request.form.get('descricao'), request.form.get('categoria')
         if senha == SENHA_SISTEMA:
-            conn.execute("INSERT INTO chamados (pc_id, descricao, categoria) VALUES (?, ?, ?)", (pc_id, desc, cat))
+            cur.execute("INSERT INTO chamados (pc_id, descricao, categoria) VALUES (%s, %s, %s)", (pc_id, desc, cat))
             conn.commit()
             flash('Chamado registrado! A TI foi notificada.', 'success')
             chamado_ativo = ('Aberto',)
         else:
             flash('Senha de professor incorreta!', 'error')
 
+    cur.close()
     conn.close()
 
     if chamado_ativo:
@@ -561,5 +604,6 @@ def view_pc(pc_id):
     """)
 
 if __name__ == "__main__":
+    # O Render exige que você use a porta definida por eles
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)
